@@ -1,84 +1,122 @@
 package com.skybook.service;
 
 import com.google.api.client.auth.oauth2.Credential;
-import com.google.api.client.auth.oauth2.StoredCredential;
-import com.google.api.client.extensions.java6.auth.oauth2.AuthorizationCodeInstalledApp;
-import com.google.api.client.extensions.jetty.auth.oauth2.LocalServerReceiver;
+import com.google.api.client.auth.oauth2.TokenResponse;
 import com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeFlow;
 import com.google.api.client.googleapis.auth.oauth2.GoogleClientSecrets;
 import com.google.api.client.googleapis.auth.oauth2.GoogleCredential;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.api.client.json.gson.GsonFactory;
-import com.google.api.client.util.store.FileDataStoreFactory;
 import com.google.api.services.calendar.Calendar;
 import com.google.api.services.calendar.CalendarScopes;
 import com.google.api.services.calendar.model.Event;
 import com.google.api.services.calendar.model.EventDateTime;
+import com.skybook.config.GoogleCredentialsConfig;
+import com.skybook.model.GoogleToken;
 import com.skybook.model.Ticket;
-import com.skybook.repository.TicketRepository;
-import java.util.concurrent.CompletableFuture;
+import com.skybook.repository.GoogleTokenRepository;
+import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.time.ZoneId;
 import java.util.Collections;
 import java.util.List;
 
 @Service
+@RequiredArgsConstructor
 public class GoogleCalendarService {
 
-    @Value("${google.calendar.credentials.path}")
-    private String credentialsPath;
-
-    @Value("${google.calendar.tokens.path}")
-    private String tokensPath;
+    private String getCredentialsPath() {
+        return GoogleCredentialsConfig.getCredentialsFilePath();
+    }
 
     @Value("${google.calendar.application.name}")
     private String applicationName;
 
-    @Value("${google.calendar.service.account.key.path:#{null}}")
-    private String serviceAccountKeyPath;
-
     @Value("${google.calendar.id:primary}")
     private String calendarId;
 
-    @Value("${google.calendar.account.email:#{null}}")
+    @Value("${google.calendar.account.email}")
     private String calendarAccountEmail;
 
+    @Value("${app.base.url}")
+    private String appBaseUrl;
+
     private final ResourceLoader resourceLoader;
+    private final GoogleTokenRepository tokenRepository;
+
     private static final List<String> SCOPES = Collections.singletonList(CalendarScopes.CALENDAR);
     private static final GsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
 
-    public GoogleCalendarService(ResourceLoader resourceLoader) {
-        this.resourceLoader = resourceLoader;
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC: Build the Google OAuth URL — send user here to authorize
+    // ─────────────────────────────────────────────────────────────────────────
+    public String buildAuthorizationUrl(Long ticketId) throws Exception {
+        GoogleAuthorizationCodeFlow flow = buildFlow();
+        String redirectUri = appBaseUrl + "/api/auth/google/callback";
+
+        return flow.newAuthorizationUrl()
+                .setRedirectUri(redirectUri)
+                .setState(ticketId.toString())
+                .setAccessType("offline")
+                .set("prompt", "consent")   // forces refresh_token to be returned
+                .build();
     }
 
-    private String getTargetEmail(String userEmail) {
-        return (calendarAccountEmail != null && !calendarAccountEmail.isEmpty()) ? calendarAccountEmail : userEmail;
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC: Handle Google's callback — exchange code for tokens, save to DB
+    // ─────────────────────────────────────────────────────────────────────────
+    public void handleCallback(String code, String state) throws Exception {
+        GoogleAuthorizationCodeFlow flow = buildFlow();
+        String redirectUri = appBaseUrl + "/api/auth/google/callback";
+
+        TokenResponse response = flow.newTokenRequest(code)
+                .setRedirectUri(redirectUri)
+                .execute();
+
+        // Persist tokens to PostgreSQL
+        GoogleToken token = tokenRepository.findById(calendarAccountEmail)
+                .orElse(new GoogleToken());
+
+        token.setEmail(calendarAccountEmail);
+        token.setAccessToken(response.getAccessToken());
+
+        // Only overwrite refresh token if Google returned a new one
+        if (response.getRefreshToken() != null) {
+            token.setRefreshToken(response.getRefreshToken());
+        }
+
+        token.setExpirationTimeMs(
+                response.getExpiresInSeconds() != null
+                        ? System.currentTimeMillis() + (response.getExpiresInSeconds() * 1000)
+                        : null
+        );
+
+        tokenRepository.save(token);
+        System.out.println("Google tokens saved to DB for: " + calendarAccountEmail);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC: Check if we already have a valid stored token
+    // ─────────────────────────────────────────────────────────────────────────
+    public boolean isAuthorized() {
+        return tokenRepository.findById(calendarAccountEmail)
+                .map(t -> t.getRefreshToken() != null && !t.getRefreshToken().isBlank())
+                .orElse(false);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC: Create a flight event on Google Calendar
+    // ─────────────────────────────────────────────────────────────────────────
     public String[] createFlightEvent(Ticket ticket, String userEmail) {
-        String targetEmail = getTargetEmail(userEmail);
         try {
-            Calendar service;
-            
-            // Try Service Account first if available
-            if (serviceAccountKeyPath != null && !serviceAccountKeyPath.isEmpty()) {
-                try {
-                    service = getCalendarService();
-                    System.out.println("Using Service Account for calendar integration");
-                } catch (Exception e) {
-                    System.out.println("Service Account failed, falling back to OAuth: " + e.getMessage());
-                    service = buildCalendarService(targetEmail);
-                }
-            } else {
-                // Use OAuth
-                service = buildCalendarService(targetEmail);
-            }
-            
+            Calendar service = buildCalendarServiceFromDb();
+
             Event event = new Event()
                     .setSummary("✈ Flight: " + ticket.getFlight().getSource()
                                 + " → " + ticket.getFlight().getDestination())
@@ -86,21 +124,27 @@ public class GoogleCalendarService {
                     .setLocation(ticket.getFlight().getSource() + " Airport");
 
             com.google.api.client.util.DateTime startDateTime = toGoogleDateTime(
-                    ticket.getFlight().getDepartureTime().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    ticket.getFlight().getDepartureTime()
+                          .atZone(ZoneId.systemDefault())
+                          .toInstant()
+                          .toEpochMilli()
             );
             com.google.api.client.util.DateTime endDateTime = toGoogleDateTime(
-                    ticket.getFlight().getArrivalTime().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    ticket.getFlight().getArrivalTime()
+                          .atZone(ZoneId.systemDefault())
+                          .toInstant()
+                          .toEpochMilli()
             );
 
             event.setStart(new EventDateTime().setDateTime(startDateTime).setTimeZone("Asia/Karachi"));
             event.setEnd(new EventDateTime().setDateTime(endDateTime).setTimeZone("Asia/Karachi"));
 
-            Event createdEvent = service.events().insert(calendarId, event).execute();
-            
-            System.out.println("Calendar event created - ID: " + createdEvent.getId());
-            System.out.println("Calendar event URL: " + createdEvent.getHtmlLink());
-            
-            return new String[]{ createdEvent.getId(), createdEvent.getHtmlLink() };
+            Event created = service.events().insert(calendarId, event).execute();
+
+            System.out.println("Calendar event created — ID: " + created.getId());
+            System.out.println("Calendar event URL: " + created.getHtmlLink());
+
+            return new String[]{ created.getId(), created.getHtmlLink() };
 
         } catch (Exception e) {
             System.err.println("Google Calendar event creation failed: " + e.getMessage());
@@ -109,164 +153,101 @@ public class GoogleCalendarService {
         }
     }
 
-    private Calendar getCalendarService() throws Exception {
-        // Load service account credentials
-        java.io.File keyFile = new java.io.File(serviceAccountKeyPath);
-        if (!keyFile.exists()) {
-            throw new RuntimeException("Service account key file not found: " + serviceAccountKeyPath);
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC: Delete a flight event from Google Calendar
+    // ─────────────────────────────────────────────────────────────────────────
+    public void deleteFlightEvent(String eventId, String userEmail) {
+        try {
+            if (eventId == null || eventId.isBlank()) return;
+            Calendar service = buildCalendarServiceFromDb();
+            service.events().delete(calendarId, eventId).execute();
+            System.out.println("Calendar event deleted — ID: " + eventId);
+        } catch (Exception e) {
+            System.err.println("Google Calendar event deletion failed: " + e.getMessage());
+            e.printStackTrace();
         }
-        
-        GoogleCredential credential = GoogleCredential.fromStream(
-                new java.io.FileInputStream(keyFile))
-                .createScoped(Collections.singleton(CalendarScopes.CALENDAR));
-        
-        return new Calendar.Builder(
-                GoogleNetHttpTransport.newTrustedTransport(),
-                JSON_FACTORY,
-                credential)
-                .setApplicationName(applicationName)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE: Build the OAuth flow (no token storage — we use DB instead)
+    // ─────────────────────────────────────────────────────────────────────────
+    private GoogleAuthorizationCodeFlow buildFlow() throws Exception {
+        InputStream in = resourceLoader.getResource(getCredentialsPath()).getInputStream();
+        GoogleClientSecrets secrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
+        NetHttpTransport transport = GoogleNetHttpTransport.newTrustedTransport();
+
+        return new GoogleAuthorizationCodeFlow.Builder(transport, JSON_FACTORY, secrets, SCOPES)
+                .setAccessType("offline")
                 .build();
     }
 
-    public boolean isAuthorized(String userEmail) {
-        String targetEmail = getTargetEmail(userEmail);
-        try {
-            InputStream in = resourceLoader.getResource(credentialsPath).getInputStream();
-            GoogleClientSecrets clientSecrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
-            FileDataStoreFactory dataStoreFactory = new FileDataStoreFactory(new java.io.File(tokensPath));
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE: Build Calendar client using tokens from PostgreSQL
+    // ─────────────────────────────────────────────────────────────────────────
+    private Calendar buildCalendarServiceFromDb() throws Exception {
+        GoogleToken stored = tokenRepository.findById(calendarAccountEmail)
+                .orElseThrow(() -> new RuntimeException(
+                        "No Google token found in DB. Visit /api/auth/google/authorize?ticketId=1 to authorize."));
 
-            GoogleAuthorizationCodeFlow flow = new GoogleAuthorizationCodeFlow.Builder(
-                    GoogleNetHttpTransport.newTrustedTransport(), JSON_FACTORY, clientSecrets, SCOPES)
-                    .setDataStoreFactory(dataStoreFactory)
-                    .setAccessType("offline")
-                    .build();
-
-            Credential existing = flow.loadCredential(targetEmail);
-            return existing != null
-                    && (existing.getRefreshToken() != null
-                        || existing.getExpiresInSeconds() == null
-                        || existing.getExpiresInSeconds() > 60);
-        } catch (Exception e) {
-            System.err.println("isAuthorized check failed for user: " + targetEmail + ". Error: " + e.getMessage());
-            return false;
+        if (stored.getRefreshToken() == null || stored.getRefreshToken().isBlank()) {
+            throw new RuntimeException("Refresh token is missing. Re-authorize at /api/auth/google/authorize?ticketId=1");
         }
-    }
 
-    public String requestAuthorizationAndGetUrl(Ticket ticket, String userEmail, TicketRepository ticketRepository) {
-        String targetEmail = getTargetEmail(userEmail);
-        try {
-            final NetHttpTransport transport = GoogleNetHttpTransport.newTrustedTransport();
-            InputStream in = resourceLoader.getResource(credentialsPath).getInputStream();
-            GoogleClientSecrets clientSecrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
-            FileDataStoreFactory dataStoreFactory = new FileDataStoreFactory(new java.io.File(tokensPath));
+        InputStream in = resourceLoader.getResource(getCredentialsPath()).getInputStream();
+        GoogleClientSecrets secrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
+        NetHttpTransport transport = GoogleNetHttpTransport.newTrustedTransport();
 
-            GoogleAuthorizationCodeFlow flow = new GoogleAuthorizationCodeFlow.Builder(
-                    transport, JSON_FACTORY, clientSecrets, SCOPES)
-                    .setDataStoreFactory(dataStoreFactory)
-                    .setAccessType("offline")
-                    .build();
+        GoogleCredential credential = new GoogleCredential.Builder()
+                .setTransport(transport)
+                .setJsonFactory(JSON_FACTORY)
+                .setClientSecrets(
+                        secrets.getDetails().getClientId(),
+                        secrets.getDetails().getClientSecret()
+                )
+                .build();
 
-            LocalServerReceiver receiver = new LocalServerReceiver.Builder()
-                    .setPort(8889)
-                    .build();
-            
-            String redirectUri = receiver.getRedirectUri(); // This starts the Jetty server
-            String authorizationUrl = flow.newAuthorizationUrl().setRedirectUri(redirectUri).build();
+        credential.setAccessToken(stored.getAccessToken());
+        credential.setRefreshToken(stored.getRefreshToken());
 
-            CompletableFuture.runAsync(() -> {
-                try {
-                    System.out.println("Background OAuth listener active on port 8889. Waiting for code...");
-                    String code = receiver.waitForCode();
-                    System.out.println("Received OAuth authorization code. Exchanging for token...");
-                    com.google.api.client.auth.oauth2.TokenResponse response = flow.newTokenRequest(code).setRedirectUri(redirectUri).execute();
-                    flow.createAndStoreCredential(response, targetEmail);
-                    System.out.println("OAuth token stored for " + targetEmail);
+        // Refresh access token if it's expiring within 60 seconds
+        boolean isExpiringSoon = stored.getExpirationTimeMs() != null
+                && stored.getExpirationTimeMs() - System.currentTimeMillis() < 60_000;
 
-                    // Refresh ticket from DB in case it changed during auth
-                    Ticket currentTicket = ticketRepository.findById(ticket.getId()).orElse(ticket);
-                    String[] calResult = createFlightEvent(currentTicket, targetEmail);
-                    if (calResult != null && calResult.length == 2) {
-                        currentTicket.setGoogleEventId(calResult[0]);
-                        currentTicket.setCalendarEventUrl(calResult[1]);
-                        ticketRepository.save(currentTicket);
-                        System.out.println("Google Calendar event created post-auth and saved to ticket " + currentTicket.getId());
-                    }
-                } catch (Exception e) {
-                    System.err.println("Error in background OAuth processing: " + e.getMessage());
-                    e.printStackTrace();
-                } finally {
-                    try {
-                        receiver.stop();
-                        System.out.println("Background OAuth receiver stopped.");
-                    } catch (Exception e) {
-                        System.err.println("Failed to stop background receiver: " + e.getMessage());
-                    }
-                }
-            });
+        if (isExpiringSoon) {
+            System.out.println("Access token expiring soon — refreshing...");
+            boolean refreshed = credential.refreshToken();
 
-            return authorizationUrl;
-        } catch (Exception e) {
-            System.err.println("Failed to initiate background OAuth: " + e.getMessage());
-            e.printStackTrace();
-            return null;
+            if (refreshed) {
+                stored.setAccessToken(credential.getAccessToken());
+                stored.setExpirationTimeMs(
+                        credential.getExpiresInSeconds() != null
+                                ? System.currentTimeMillis() + credential.getExpiresInSeconds() * 1000
+                                : null
+                );
+                tokenRepository.save(stored);
+                System.out.println("Access token refreshed and saved to DB.");
+            } else {
+                System.err.println("Token refresh failed — user may need to re-authorize.");
+            }
         }
-    }
 
-    // Keep your existing methods
-    private Calendar buildCalendarService(String userEmail) throws Exception {
-        String targetEmail = getTargetEmail(userEmail);
-        final NetHttpTransport transport = GoogleNetHttpTransport.newTrustedTransport();
-        Credential credential = authorize(transport, targetEmail);
         return new Calendar.Builder(transport, JSON_FACTORY, credential)
                 .setApplicationName(applicationName)
                 .build();
     }
 
-    private Credential authorize(NetHttpTransport transport, String userEmail) throws Exception {
-        String targetEmail = getTargetEmail(userEmail);
-        InputStream in = resourceLoader.getResource(credentialsPath).getInputStream();
-        GoogleClientSecrets clientSecrets = GoogleClientSecrets.load(JSON_FACTORY, new InputStreamReader(in));
-
-        FileDataStoreFactory dataStoreFactory = new FileDataStoreFactory(new java.io.File(tokensPath));
-
-        GoogleAuthorizationCodeFlow flow = new GoogleAuthorizationCodeFlow.Builder(
-                transport, JSON_FACTORY, clientSecrets, SCOPES)
-                .setDataStoreFactory(dataStoreFactory)
-                .setAccessType("offline")
-                .build();
-
-        Credential existing = flow.loadCredential(targetEmail);
-        if (existing != null
-                && (existing.getRefreshToken() != null
-                    || existing.getExpiresInSeconds() == null
-                    || existing.getExpiresInSeconds() > 60)) {
-            return existing;
-        }
-
-        System.out.println("No stored token for " + targetEmail + " — opening browser for one-time auth...");
-        LocalServerReceiver receiver = new LocalServerReceiver.Builder()
-                .setPort(8889)
-                .build();
-        return new AuthorizationCodeInstalledApp(flow, receiver).authorize(targetEmail);
-    }
-
-    public void deleteFlightEvent(String eventId, String userEmail) {
-        String targetEmail = getTargetEmail(userEmail);
-        try {
-            if (eventId == null || eventId.isBlank()) return;
-            Calendar service = buildCalendarService(targetEmail);
-            service.events().delete(calendarId, eventId).execute();
-        } catch (Exception e) {
-            System.err.println("Google Calendar event deletion failed: " + e.getMessage());
-        }
-    }
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE: Helpers
+    // ─────────────────────────────────────────────────────────────────────────
     private String buildEventDescription(Ticket ticket) {
         return String.format(
-            "SkyBook Booking Confirmation\n\nTicket: %s\nPassenger: %s\nAirline: %s\nFlight: %s\nSeat: %s\nPrice: USD %s",
-            ticket.getId(), ticket.getPassengerName(),
-            ticket.getFlight().getAirline(), ticket.getFlight().getId(),
-            ticket.getSeatNumber(), ticket.getFlight().getPrice()
+                "SkyBook Booking Confirmation\n\nTicket: %s\nPassenger: %s\nAirline: %s\nFlight: %s\nSeat: %s\nPrice: USD %s",
+                ticket.getId(),
+                ticket.getPassengerName(),
+                ticket.getFlight().getAirline(),
+                ticket.getFlight().getId(),
+                ticket.getSeatNumber(),
+                ticket.getFlight().getPrice()
         );
     }
 
