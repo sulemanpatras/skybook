@@ -32,14 +32,12 @@ public class GoogleAuthController {
     @GetMapping("/callback")
     public ResponseEntity<Void> callback(
             @RequestParam String code,
-            @RequestParam String state) {   // state = ticketId
+            @RequestParam String state) {   // state = ticketId string e.g. "TK00001"
         try {
-            // Exchange code for tokens and save to DB
             calendarService.handleCallback(code, state);
 
-            // Create the calendar event for the ticket
-            Long ticketId = Long.parseLong(state);
-            Ticket ticket = ticketRepository.findById(ticketId).orElseThrow();
+            // state is the full ticket ID string e.g. "TK00001"
+            Ticket ticket = ticketRepository.findById(state).orElseThrow();
             String[] result = calendarService.createFlightEvent(ticket, null);
 
             if (result != null) {
@@ -48,13 +46,12 @@ public class GoogleAuthController {
                 ticketRepository.save(ticket);
             }
 
-            // Redirect back to frontend success page
             return ResponseEntity.status(HttpStatus.FOUND)
                     .header("Location", "https://airplane-ticket-management.vercel.app/my-tickets")
                     .build();
 
         } catch (Exception e) {
-            // Redirect to frontend with error
+            System.err.println("OAuth callback failed: " + e.getMessage());
             return ResponseEntity.status(HttpStatus.FOUND)
                     .header("Location", "https://airplane-ticket-management.vercel.app/my-tickets?calendarError=true")
                     .build();

@@ -56,7 +56,7 @@ public class GoogleCalendarService {
     // ─────────────────────────────────────────────────────────────────────────
     // PUBLIC: Build the Google OAuth URL — send user here to authorize
     // ─────────────────────────────────────────────────────────────────────────
-    public String buildAuthorizationUrl(Long ticketId) throws Exception {
+    public String buildAuthorizationUrl(String ticketId) throws Exception {
         GoogleAuthorizationCodeFlow flow = buildFlow();
         String redirectUri = appBaseUrl + "/api/auth/google/callback";
 
