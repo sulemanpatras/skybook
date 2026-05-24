@@ -19,7 +19,7 @@ public class GoogleAuthController {
 
     // Step 1: Frontend calls this to get the Google auth URL
     @GetMapping("/authorize")
-    public ResponseEntity<String> authorize(@RequestParam Long ticketId) {
+    public ResponseEntity<String> authorize(@RequestParam String ticketId) {
         try {
             String url = calendarService.buildAuthorizationUrl(ticketId);
             return ResponseEntity.ok(url);
