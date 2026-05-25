@@ -11,6 +11,7 @@ import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.services.calendar.Calendar;
 import com.google.api.services.calendar.CalendarScopes;
 import com.google.api.services.calendar.model.Event;
+import com.google.api.services.calendar.model.EventAttendee;
 import com.google.api.services.calendar.model.EventDateTime;
 import com.skybook.config.GoogleCredentialsConfig;
 import com.skybook.model.GoogleToken;
@@ -20,6 +21,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.stereotype.Service;
+import java.util.Arrays;
 
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -123,23 +125,35 @@ public class GoogleCalendarService {
                     .setDescription(buildEventDescription(ticket))
                     .setLocation(ticket.getFlight().getSource() + " Airport");
 
+            // ── ADD THIS: invite the user so it appears on their calendar ──
+            if (userEmail != null && !userEmail.isBlank()) {
+                EventAttendee attendee = new EventAttendee()
+                        .setEmail(userEmail)
+                        .setResponseStatus("accepted"); // auto-accept so it shows immediately
+                event.setAttendees(Arrays.asList(attendee));
+            }
+
             com.google.api.client.util.DateTime startDateTime = toGoogleDateTime(
                     ticket.getFlight().getDepartureTime()
-                          .atZone(ZoneId.systemDefault())
-                          .toInstant()
-                          .toEpochMilli()
+                        .atZone(ZoneId.systemDefault())
+                        .toInstant()
+                        .toEpochMilli()
             );
             com.google.api.client.util.DateTime endDateTime = toGoogleDateTime(
                     ticket.getFlight().getArrivalTime()
-                          .atZone(ZoneId.systemDefault())
-                          .toInstant()
-                          .toEpochMilli()
+                        .atZone(ZoneId.systemDefault())
+                        .toInstant()
+                        .toEpochMilli()
             );
 
             event.setStart(new EventDateTime().setDateTime(startDateTime).setTimeZone("Asia/Karachi"));
             event.setEnd(new EventDateTime().setDateTime(endDateTime).setTimeZone("Asia/Karachi"));
 
-            Event created = service.events().insert(calendarId, event).execute();
+            // ── ADD sendUpdates=all so Google actually sends the invite ──
+            Event created = service.events()
+                    .insert(calendarId, event)
+                    .setSendUpdates("all")   // sends invite email + adds to user's calendar
+                    .execute();
 
             System.out.println("Calendar event created — ID: " + created.getId());
             System.out.println("Calendar event URL: " + created.getHtmlLink());

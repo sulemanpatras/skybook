@@ -38,7 +38,7 @@ public class GoogleAuthController {
 
             // state is the full ticket ID string e.g. "TK00001"
             Ticket ticket = ticketRepository.findById(state).orElseThrow();
-            String[] result = calendarService.createFlightEvent(ticket, null);
+            String[] result = calendarService.createFlightEvent(ticket, ticket.getUser().getEmail());
 
             if (result != null) {
                 ticket.setGoogleEventId(result[0]);
