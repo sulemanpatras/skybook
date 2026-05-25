@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS tickets (
     calendar_event_url VARCHAR(500)
 );
 
+-- Google OAuth Tokens table
+CREATE TABLE IF NOT EXISTS google_tokens (
+    email VARCHAR(150) PRIMARY KEY,
+    access_token TEXT,
+    refresh_token TEXT,
+    expiration_time_ms BIGINT
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_flight_id ON tickets(flight_id);
