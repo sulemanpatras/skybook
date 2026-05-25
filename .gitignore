@@ -4,3 +4,4 @@ target/
 # Secrets
 google-credentials.json
 *.json
+.env
